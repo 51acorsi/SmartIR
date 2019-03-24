@@ -439,27 +439,26 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
                     if abs(self.target_temperature - self.current_temperature) >= self.cold_tolerance:
                         _LOGGER.info("Too cold, turning on heat")
                         self._current_operation = STATE_HEAT
-                    elif self.target_temperature == self.current_temperature:
-                        _LOGGER.info("Target temperature reached, lowering fan speed")
-                        self._current_fan_mode = FAN_MODE_LOW
-                    else:
+                        self._current_fan_mode = FAN_MODE_HIGH
+                    elif abs(self.target_temperature - self.current_temperature) >= self.cold_tolerance/2:
                         _LOGGER.info("Getting closer to cold tolerance, going idle")
                         self._current_operation = STATE_IDLE
+                    else:
+                        self._current_fan_mode = self._async_define_fan_speed()
 
                 #Check for warm
                 _LOGGER.info("Check if is overly hot")
                 if self.current_operation in [STATE_HEAT, STATE_IDLE] and self.target_temperature <= self.current_temperature:
                     if abs(self.target_temperature - self.current_temperature) >= self.hot_tolerance:
                         _LOGGER.info("Too hot, turning on cooling")
-                        self._current_operation = STATE_COOL                        
-                    elif self.target_temperature == self.current_temperature:
-                        _LOGGER.info("Target temperature reached, lowering fan speed")
-                        self._current_fan_mode = FAN_MODE_LOW
-                    else:
+                        self._current_operation = STATE_COOL
+                        self._current_fan_mode = FAN_MODE_HIGH                 
+                    elif abs(self.target_temperature - self.current_temperature) >= self.hot_tolerance/2:
                         _LOGGER.info("Getting closer to hot tolerance, going idle")
                         self._current_operation = STATE_IDLE
+                    else:
+                        self._current_fan_mode = self._async_define_fan_speed()                
                 
-                self._current_fan_mode = self._async_define_fan_speed()
                 if previous_operation_mode != self._current_operation or previous_fan_mode != self._current_fan_mode:
                     return True
                 else:
@@ -471,7 +470,7 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
         temp_dif = abs(self.current_temperature - self.target_temperature)
         if temp_dif < 0.1:
             return FAN_MODE_LOW
-        elif temp_dif < 1:
+        elif temp_dif < 0.5:
             return FAN_MODE_MED
         else:
             return FAN_MODE_HIGH
