@@ -7,7 +7,7 @@ import voluptuous as vol
 
 from homeassistant.components.climate import ClimateDevice, PLATFORM_SCHEMA
 from homeassistant.components.climate.const import (
-    STATE_HEAT, STATE_COOL, STATE_AUTO, STATE_DRY,
+    STATE_HEAT, STATE_COOL, STATE_AUTO, STATE_DRY, STATE_IDLE,
     SUPPORT_OPERATION_MODE, SUPPORT_TARGET_TEMPERATURE, SUPPORT_FAN_MODE,
     SUPPORT_ON_OFF)
 from homeassistant.const import (
@@ -20,9 +20,14 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from . import COMPONENT_ABS_DIR, Helper
 from .controller import Controller
 
+FAN_MODE_LOW = "low"
+FAN_MODE_MED = "med"
+FAN_MODE_HIGH = "high"
+
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = "SmartIR Climate"
+DEFAULT_TOLERANCE = 0.5
 
 CONF_UNIQUE_ID = 'unique_id'
 CONF_DEVICE_CODE = 'device_code'
@@ -31,6 +36,9 @@ CONF_CONTROLLER_COMMAND_TOPIC = "controller_command_topic"
 CONF_TEMPERATURE_SENSOR = 'temperature_sensor'
 CONF_HUMIDITY_SENSOR = 'humidity_sensor'
 CONF_POWER_SENSOR = 'power_sensor'
+CONF_MIN_DUR = 'min_cycle_duration'
+CONF_COLD_TOLERANCE = 'cold_tolerance'
+CONF_HOT_TOLERANCE = 'hot_tolerance'
 
 SUPPORT_FLAGS = (
     SUPPORT_TARGET_TEMPERATURE | 
@@ -47,7 +55,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_CONTROLLER_COMMAND_TOPIC): cv.string,
     vol.Optional(CONF_TEMPERATURE_SENSOR): cv.entity_id,
     vol.Optional(CONF_HUMIDITY_SENSOR): cv.entity_id,
-    vol.Optional(CONF_POWER_SENSOR): cv.entity_id
+    vol.Optional(CONF_POWER_SENSOR): cv.entity_id,
+    vol.Optional(CONF_COLD_TOLERANCE, default=DEFAULT_TOLERANCE): vol.Coerce(float),
+    vol.Optional(CONF_HOT_TOLERANCE, default=DEFAULT_TOLERANCE): vol.Coerce(float),
+    vol.Optional(CONF_MIN_DUR): vol.All(cv.time_period, cv.positive_timedelta),
 })
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -101,6 +112,9 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
         self._temperature_sensor = config.get(CONF_TEMPERATURE_SENSOR)
         self._humidity_sensor = config.get(CONF_HUMIDITY_SENSOR)
         self._power_sensor = config.get(CONF_POWER_SENSOR)
+        self._cold_tolerance = config.get(CONF_COLD_TOLERANCE)
+        self._hot_tolerance = config.get(CONF_HOT_TOLERANCE)
+        self._min_cycle_duration = config.get(CONF_MIN_DUR)
 
         self._manufacturer = device_data['manufacturer']
         self._supported_models = device_data['supportedModels']
@@ -109,7 +123,7 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
         self._min_temperature = device_data['minTemperature']
         self._max_temperature = device_data['maxTemperature']
         self._precision = device_data['precision']
-        self._operation_modes = [STATE_OFF] + device_data['operationModes']
+        self._operation_modes = [STATE_OFF] + device_data['operationModes'] + [STATE_IDLE]
         self._fan_modes = device_data['fanModes']
         self._commands = device_data['commands']
 
@@ -214,6 +228,21 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
         return self._precision
 
     @property
+    def min_cycle_duration(self):
+        """Return the min cycle duration"""
+        return self._min_cycle_duration
+    
+    @property
+    def cold_tolerance(self):
+        """Return the cold_tolerance"""
+        return self._cold_tolerance
+
+    @property
+    def hot_tolerance(self):
+        """Return the hot_tolerance"""
+        return self._hot_tolerance
+
+    @property
     def operation_list(self):
         """Return the list of available operation modes."""
         return self._operation_modes
@@ -313,7 +342,9 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
         
     async def async_turn_on(self):
         """Turn on."""
-        if self._last_on_operation is not None:
+        if self.target_temperature is not None:
+            await self.async_set_operation_mode(self._define_operation_by_target_temp)
+        elif self._last_on_operation is not None:
             await self.async_set_operation_mode(self._last_on_operation)
         else:
             await self.async_set_operation_mode(self._operation_modes[1])
@@ -325,7 +356,7 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
             fan_mode = self._current_fan_mode
             target_temperature = '{0:g}'.format(self._target_temperature)
 
-            if operation_mode.lower() == STATE_OFF:
+            if operation_mode.lower() == STATE_OFF or operation_mode.lower() == STATE_IDLE:
                 command = self._commands['off']
             else:
                 command = self._commands[operation_mode][fan_mode][target_temperature]
@@ -341,6 +372,8 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
             return
 
         self._async_update_temp(new_state)
+        if await self._async_control_temperature():
+            await self.send_command()
         await self.async_update_ha_state()
 
     async def _async_humidity_sensor_changed(self, entity_id, old_state, new_state):
@@ -374,6 +407,82 @@ class SmartIRClimate(ClimateDevice, RestoreEntity):
                 self._current_temperature = float(state.state)
         except ValueError as ex:
             _LOGGER.error("Unable to update from temperature sensor: %s", ex)
+    
+    async def _async_control_temperature(self, time=None, force=False):
+        """Control the device based on the target temperature"""
+        async with self._temp_lock:
+            _LOGGER.info("Temperature control changed, Operation: %s", self.current_operation)
+            if self.current_operation != STATE_OFF and None not in (self.current_temperature,
+                                                                    self.target_temperature):
+
+                _LOGGER.info("Temperature control "
+                            "Current: %s, Target: %s",
+                            self.current_temperature, self.target_temperature)
+                
+                # Validate if min cycle duration is through
+                _LOGGER.info("Validate if min cycle duration is through")
+                if self.current_operation != STATE_IDLE and self.min_cycle_duration and not condition.state(
+                                                        self.hass, self.current_operation, 
+                                                        self.current_operation, self.min_cycle_duration):
+
+                    _LOGGER.info("Min cycle not through"
+                                "Current operation: %s"
+                                "min_cycle_duration %s", self.current_operation, self.min_cycle_duration )
+                    return False
+                
+                previous_operation_mode = self.current_operation
+                previous_fan_mode = self.current_fan_mode
+
+                #Check for cold
+                _LOGGER.info("Check if is overly cold")
+                if self.current_operation in [STATE_COOL, STATE_IDLE] and self.target_temperature >= self.current_temperature:
+                    if abs(self.target_temperature - self.current_temperature) >= self.cold_tolerance:
+                        _LOGGER.info("Too cold, turning on heat")
+                        self._current_operation = STATE_HEAT
+                    elif self.target_temperature == self.current_temperature:
+                        _LOGGER.info("Target temperature reached, lowering fan speed")
+                        self._current_fan_mode = FAN_MODE_LOW
+                    else:
+                        _LOGGER.info("Getting closer to cold tolerance, going idle")
+                        self._current_operation = STATE_IDLE
+
+                #Check for warm
+                _LOGGER.info("Check if is overly hot")
+                if self.current_operation in [STATE_HEAT, STATE_IDLE] and self.target_temperature <= self.current_temperature:
+                    if abs(self.target_temperature - self.current_temperature) >= self.hot_tolerance:
+                        _LOGGER.info("Too hot, turning on cooling")
+                        self._current_operation = STATE_COOL                        
+                    elif self.target_temperature == self.current_temperature:
+                        _LOGGER.info("Target temperature reached, lowering fan speed")
+                        self._current_fan_mode = FAN_MODE_LOW
+                    else:
+                        _LOGGER.info("Getting closer to hot tolerance, going idle")
+                        self._current_operation = STATE_IDLE
+                
+                self._current_fan_mode = self._async_define_fan_speed()
+                if previous_operation_mode != self._current_operation or previous_fan_mode != self._current_fan_mode:
+                    return True
+                else:
+                    return False
+                       
+        return False
+
+    def _async_define_fan_speed(self):
+        temp_dif = abs(self.current_temperature - self.target_temperature)
+        if temp_dif < 0.1:
+            return FAN_MODE_LOW
+        elif temp_dif < 1:
+            return FAN_MODE_MED
+        else:
+            return FAN_MODE_HIGH
+
+    def _define_operation_by_target_temp(self):
+        if self.current_temperature > self.target_temperature:
+            return STATE_COOL
+        elif self.current_temperature < self.target_temperature:
+            return STATE_HEAT
+        else:
+            return STATE_IDLE
 
     @callback
     def _async_update_humidity(self, state):
